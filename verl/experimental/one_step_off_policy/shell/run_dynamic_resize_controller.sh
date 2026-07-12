@@ -8,12 +8,12 @@ cd "${REPO_ROOT}"
 NUM_GPUS=${NUM_GPUS:-8}
 ACTOR_STRATEGY=${ACTOR_STRATEGY:-"fsdp2"}
 
-MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}
-MODEL_PATH=${MODEL_PATH:-/file_system/common-models/Qwen/Qwen2.5-1.5B-Instruct}
+MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
+MODEL_PATH=${MODEL_PATH:-/data/common/models/Qwen/Qwen2.5-0.5B}
 RESOLVED_MODEL_PATH="${MODEL_PATH}"
 
-TRAIN_FILE=${TRAIN_FILE:-/file_system/common-data/new_gsm8k/train.parquet}
-VAL_FILE=${VAL_FILE:-/file_system/common-data/new_gsm8k/test.parquet}
+TRAIN_FILE=${TRAIN_FILE:-/data/common/dataset/gsm8k_verl/train.parquet}
+VAL_FILE=${VAL_FILE:-/data/common/dataset/gsm8k_verl/test.parquet}
 
 n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
 n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
@@ -45,8 +45,8 @@ COMM_CACHE_ENABLE=${COMM_CACHE_ENABLE:-false}
 COMM_CACHE_RESERVE_SCHEDULE=${COMM_CACHE_RESERVE_SCHEDULE:-true}
 BUDGET_PROTECTION_ENABLE=${BUDGET_PROTECTION_ENABLE:-false}
 MEMORY_BUDGET_RATIO=${MEMORY_BUDGET_RATIO:-0.85}
-CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
-RAY_TMPDIR=${RAY_TMPDIR:-}
+CKPT_DIR=${CKPT_DIR:-/data/rjy/save_ckpt/dynamic-resize}
+RAY_TMPDIR=${RAY_TMPDIR:-/data/rjy/ray_tmp}
 
 if [[ -n "${RAY_TMPDIR}" ]]; then
   mkdir -p "${RAY_TMPDIR}"
@@ -114,6 +114,8 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.test_freq=-1 \
   trainer.resume_mode=disable \
   trainer.logger='["console"]' \
+  +ray_kwargs.ray_init.dashboard_host=0.0.0.0 \
+  +ray_kwargs.ray_init.dashboard_port=8265 \
   actor_rollout_ref.hybrid_engine=false \
   actor_rollout_ref.actor.use_torch_compile=false \
   actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY} \

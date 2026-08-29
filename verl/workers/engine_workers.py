@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import hashlib
 import logging
 import os
 import shutil
@@ -602,6 +603,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
         self.rollout: BaseRollout = None
+        # Test-only lifecycle probes kept outside the replaceable FSDP runtime.
+        # A future ReshardPlan integration must retain independently owned
+        # ``source.detach().clone()`` storage here, never an FSDP parameter view.
+        self._held_delta_probe_tensors: dict[str, torch.Tensor] = {}
+        self._held_delta_probe_specs: dict[str, dict[str, int | str]] = {}
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
@@ -639,6 +645,147 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
+
+    @staticmethod
+    def _device_memory_snapshot() -> dict[str, int | None]:
+        device_module = get_torch_device()
+        allocated_bytes = None
+        reserved_bytes = None
+        free_bytes = None
+        total_bytes = None
+        try:
+            allocated_bytes = int(device_module.memory_allocated())
+            reserved_bytes = int(device_module.memory_reserved())
+            free_bytes, total_bytes = (int(value) for value in device_module.mem_get_info())
+        except Exception:
+            pass
+        return {
+            "device_memory_allocated_bytes": allocated_bytes,
+            "device_memory_reserved_bytes": reserved_bytes,
+            "device_memory_free_bytes": free_bytes,
+            "device_memory_total_bytes": total_bytes,
+        }
+
+    def _held_delta_probe_snapshot(self, key: str) -> dict[str, object]:
+        if key not in self._held_delta_probe_tensors:
+            raise KeyError(f"held delta tensor {key!r} is not installed")
+
+        import ray
+
+        tensor = self._held_delta_probe_tensors[key]
+        spec = self._held_delta_probe_specs[key]
+        expected = torch.arange(spec["numel"], dtype=tensor.dtype, device=tensor.device)
+        expected.add_(spec["start_value"])
+        exact_match = bool(torch.equal(tensor, expected))
+        del expected
+
+        content = tensor.detach().to("cpu").contiguous().numpy().tobytes()
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        actor_id = str(ray.get_runtime_context().get_actor_id())
+        snapshot: dict[str, object] = {
+            "physical_rank": self.rank,
+            "actor_id": actor_id,
+            "pid": os.getpid(),
+            "probe_key": key,
+            "object_id": id(tensor),
+            "data_ptr": tensor.data_ptr(),
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "numel": tensor.numel(),
+            "nbytes": tensor.numel() * tensor.element_size(),
+            "owns_storage": tensor._base is None,
+            "content_sha256": content_sha256,
+            "expected_sha256": spec["expected_sha256"],
+            "exact_match": exact_match,
+        }
+        snapshot.update(self._device_memory_snapshot())
+        return snapshot
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_install_held_delta_tensor(self, key: str, numel: int = 4096) -> dict[str, object]:
+        """Install an independently owned deterministic tensor for lifecycle tests."""
+        if not key:
+            raise ValueError("held delta tensor key must not be empty")
+        if key in self._held_delta_probe_tensors:
+            raise ValueError(f"held delta tensor {key!r} is already installed")
+        if numel <= 0:
+            raise ValueError(f"held delta tensor numel must be positive, got {numel}")
+
+        device_module = get_torch_device()
+        if not device_module.is_available():
+            raise RuntimeError(f"{get_device_name()} is required for a held delta tensor")
+
+        start_value = self.rank * 1_000_000
+        tensor = torch.arange(numel, dtype=torch.int64, device=get_device_name())
+        tensor.add_(start_value)
+        if tensor._base is not None:
+            raise AssertionError("held delta probe must own its device storage")
+        expected_sha256 = hashlib.sha256(tensor.detach().to("cpu").numpy().tobytes()).hexdigest()
+        self._held_delta_probe_tensors[key] = tensor
+        self._held_delta_probe_specs[key] = {
+            "numel": numel,
+            "start_value": start_value,
+            "expected_sha256": expected_sha256,
+        }
+        return self._held_delta_probe_snapshot(key)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_inspect_held_delta_tensor(self, key: str) -> dict[str, object]:
+        """Return exact identity, content, and memory evidence for a held slice."""
+        return self._held_delta_probe_snapshot(key)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_release_held_delta_tensor(self, key: str) -> dict[str, object]:
+        """Release a held slice explicitly and report post-release device memory."""
+        snapshot = self._held_delta_probe_snapshot(key)
+        tensor = self._held_delta_probe_tensors.pop(key)
+        self._held_delta_probe_specs.pop(key)
+        del tensor
+        snapshot["released"] = True
+        snapshot["remaining_probe_keys"] = sorted(self._held_delta_probe_tensors)
+        snapshot["memory_after_release"] = self._device_memory_snapshot()
+        return snapshot
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_check_actor_process_group(self, run_collective: bool = True) -> dict[str, object]:
+        """Inspect membership and optionally all-reduce on the actor subgroup."""
+        if self.actor is None:
+            raise RuntimeError("actor worker is not initialized")
+        process_group = getattr(self.actor.engine, "process_group", None)
+        if process_group is None:
+            if run_collective:
+                raise RuntimeError("actor process group is not installed on this worker")
+            return {
+                "physical_rank": self.rank,
+                "is_member": False,
+                "group_rank": None,
+                "group_world_size": None,
+            }
+
+        group_rank = torch.distributed.get_rank(group=process_group)
+        group_world_size = torch.distributed.get_world_size(group=process_group)
+        if not run_collective:
+            return {
+                "physical_rank": self.rank,
+                "is_member": True,
+                "group_rank": group_rank,
+                "group_world_size": group_world_size,
+            }
+
+        reduced = torch.tensor(group_rank + 1, dtype=torch.int64, device=get_device_name())
+        torch.distributed.all_reduce(reduced, group=process_group)
+        expected = group_world_size * (group_world_size + 1) // 2
+        reduced_value = int(reduced.item())
+        return {
+            "physical_rank": self.rank,
+            "is_member": True,
+            "group_rank": group_rank,
+            "group_world_size": group_world_size,
+            "all_reduce_value": reduced_value,
+            "all_reduce_expected": expected,
+            "all_reduce_exact": reduced_value == expected,
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):

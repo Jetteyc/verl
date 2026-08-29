@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import ray
 
 from verl import DataProto
@@ -30,6 +32,7 @@ from verl.utils.device import get_device_name
 class Actor(Worker):
     def __init__(self) -> None:
         super().__init__()
+        self._resident_markers = {}
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def add(self, data: DataProto):
@@ -39,6 +42,24 @@ class Actor(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_rank(self):
         return self.rank
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def install_resident_marker(self, key, value):
+        if key in self._resident_markers:
+            raise ValueError(f"resident marker {key!r} already exists")
+        self._resident_markers[key] = {"value": value}
+        return self.inspect_resident_marker(key)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def inspect_resident_marker(self, key):
+        marker = self._resident_markers[key]
+        return {
+            "actor_id": str(ray.get_runtime_context().get_actor_id()),
+            "pid": os.getpid(),
+            "rank": self.rank,
+            "marker_id": id(marker),
+            "value": marker["value"],
+        }
 
 
 @ray.remote
@@ -81,9 +102,13 @@ def test_colocated_workers_fused():
     colocated_actor_wg = spawn_wg["actor"]
     colocated_critic_wg = spawn_wg["critic"]
 
+    marker_before = colocated_actor_wg.install_resident_marker("delta-owner", 20260829)
     actor_subgroup = colocated_actor_wg.subgroup([0])
     assert actor_subgroup.world_size == 1
     assert actor_subgroup.get_rank() == [0]
+    assert actor_subgroup.workers[0] is colocated_actor_wg.workers[0]
+    assert actor_subgroup.inspect_resident_marker("delta-owner") == [marker_before[0]]
+    assert colocated_actor_wg.inspect_resident_marker("delta-owner") == marker_before
 
     actor_output = colocated_actor_wg.add(data)
     critic_output = colocated_critic_wg.sub(data)

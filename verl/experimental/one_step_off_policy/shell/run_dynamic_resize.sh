@@ -51,6 +51,7 @@ BUDGET_PROTECTION_ENABLE=${BUDGET_PROTECTION_ENABLE:-false}
 MEMORY_BUDGET_RATIO=${MEMORY_BUDGET_RATIO:-0.85}
 CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
 PROFILER_ENABLE=${PROFILER_ENABLE:-true}
+OPTIMIZER_CHECK_ENABLE=${OPTIMIZER_CHECK_ENABLE:-true}
 RAY_TMPDIR=${RAY_TMPDIR:-}
 
 if [[ -n "${RAY_TMPDIR}" ]]; then
@@ -116,6 +117,26 @@ print(f"TRAIN_FILE={shlex.quote(train)}")
 print(f"VAL_FILE={shlex.quote(val)}")
 PY_CONVERT
 )"
+
+# VERL_RESIZE_VERIFY=1 selects the verification version of this launcher, anything else the plain one.
+# Before training, the optimizer check takes the model through the actor sizes of the run. During
+# training every gpu_direct switch compares both sides (the workers read the variable), verl logs at
+# DEBUG level and the resize metrics of every step go to ${CKPT_DIR}/resize_trace.jsonl.
+if [[ "${VERL_RESIZE_VERIFY:-}" == "1" ]]; then
+  export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-DEBUG}
+  set -- trainer.dynamic_resize.trace.enable=true \
+    trainer.dynamic_resize.trace.path="${CKPT_DIR}/resize_trace.jsonl" "$@"
+  if [[ "${HOST_STAGING_BACKEND}" == "gpu_direct" && "${OPTIMIZER_CHECK_ENABLE}" == "true" ]]; then
+    first_actor=${first_split_plan#\[}
+    second_actor=${second_split_plan#\[}
+    actor_sizes="${n_gpus_training},${first_actor%%,*},${second_actor%%,*}"
+    PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" MODEL_PATH="${RESOLVED_MODEL_PATH}" \
+      RESIZE_SEQUENCE="${actor_sizes}" OUT_DIR="${CKPT_DIR}/optimizer_check" \
+      python3 -m torch.distributed.run --standalone \
+      --nproc-per-node="$(tr ',' '\n' <<<"${actor_sizes}" | sort -n | tail -n 1)" \
+      tests/special_distributed/run_fsdp2_resize_optimizer.py
+  fi
+fi
 
 python3 -m verl.experimental.one_step_off_policy.main_ppo \
   --config-path=config \

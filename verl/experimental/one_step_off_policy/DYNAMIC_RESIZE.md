@@ -63,6 +63,7 @@ appended, e.g. `bash .../run_dynamic_resize.sh trainer.total_training_steps=3`.
 | `HOST_STAGING_ENABLE` / `HOST_STAGING_BACKEND` | true / `gpu_direct` | `handoff.enable` / `handoff.backend` |
 | `HYSTERESIS_*`, `BUDGET_PROTECTION_ENABLE`, `COMM_CACHE_ENABLE` | off | optional controller, memory gate, communicator cache |
 | `PROFILER_ENABLE` | true | `global_profiler.enabled`; set `false` for quick iterations |
+| `VERL_RESIZE_VERIFY` | unset | `1` checksums every tensor moved by `gpu_direct` against the source |
 
 More switches are added as further stages with the same shape as `stage0` in the yaml:
 
@@ -77,26 +78,109 @@ TOTAL_TRAINING_STEPS=8 bash .../run_dynamic_resize.sh \
 
 ## The hard switch, step by step
 
-`OneStepOffRayTrainer._apply_dynamic_resize_hard_switch` currently does, for a switch to
-`(actor_target, rollout_target)`:
+`OneStepOffRayTrainer._apply_dynamic_resize_hard_switch` with `handoff.backend=gpu_direct`, for a switch
+to `(actor_target, rollout_target)`. Nothing is written to or read from disk, and nothing is staged on the
+host; the training state moves GPU to GPU.
 
-1. Save a full checkpoint of actor (and critic) and, if `handoff.stage_optimizer`, page each rank's
-   optimizer state to the host staging directory.
-2. Quiesce rollout: abort in-flight requests on every replica, kill the agent-loop workers.
-3. `handoff.backend=gpu_direct` and an *expansion*: `FSDPEngine.stage_model_for_resize` sends each old
-   rank's parameter shards over a temporary NCCL group into a staging buffer on the new ranks
-   (`verl/utils/fsdp_resize.py`). Shrinks, and any staging failure, fall back to the checkpoint.
-4. Rebuild the training runtime: destroy the training subgroup, create the new one, rebuild the FSDP2
-   engine on the new ranks from the pretrained weights, then either copy the staged shards in or
-   `load_checkpoint`. Optimizer files are per world size, so across a world-size change the optimizer
-   restarts from a fresh state (the plan document calls this "effectively weights_only").
-5. Kill and relaunch every vLLM server actor on the new rollout ranks, rebuild the load balancer and the
-   agent-loop manager.
-6. `reconfigure_checkpoint_engine` with a fresh group name, then `update_weights` pushes the actor
-   weights to the new replicas and resumes generation.
+1. **Quiesce rollout** (`_destroy_dynamic_resize_runtime`): abort in-flight requests on every replica
+   (`sleep_replicas` is a no-op under the recipe's `free_cache_engine=False`) and kill the agent-loop
+   workers. The vLLM server actors stay up for now.
+2. **Move the training state** (`_rebuild_hybrid_training_runtime` -> `resize_actor_runtime` on every
+   physical rank): build the new FSDP2 runtime on the new ranks next to the live one, fill it shard to
+   shard with one `all_to_all_single` per tensor, swap, destroy the old groups. Details under *Training
+   state: shard-to-shard transfer*.
+3. **Re-point the control plane**: `actor_wg` / `critic_wg` become `RayWorkerGroup.subgroup(new actor ranks)`
+   views (no Ray actors are created or destroyed), the rollout view becomes the suffix ranks, and the
+   hybrid workers drop their cached server handles (`reset_rollout_server_handle`).
+4. **Rebuild rollout**: `LLMServerManager.rebuild_hybrid_runtime` kills every vLLM server actor and
+   launches new ones on the new rollout ranks, then rebuilds the load balancer and the agent-loop manager.
+   This is the dominant cost of a switch (about 34 s of vLLM engine start-up for Qwen3-0.6B).
+5. **Weight sync**: `reconfigure_checkpoint_engine(group_name, rebuild_group=True)` finalizes the old NCCL
+   weight-sync engine and creates a new one on every rank; `CheckpointEngineManager.update_weights`
+   pushes the current actor weights to the replicas and resumes generation.
+6. The trainer records the new topology and launches the next step's generation on the new rollout ranks.
 
-Steps 4 and 6 destroy and recreate process groups on every switch; the caveats this creates are
-described under *Process groups and DTensor caches across resizes* below.
+At startup the actor is still built on all physical ranks (upstream `init_model`) and then moved onto the
+initial actor ranks with the same transfer (`_rebuild_hybrid_training_runtime(old_ranks=range(pool))`),
+so a default run shows three transfers: pool -> initial split, then the two scheduled switches.
+
+## Training state: shard-to-shard transfer
+
+### Layers
+
+| Layer | File | Responsibility |
+|---|---|---|
+| trainer | `one_step_off_policy/ray_trainer.py` | decides the topology; `_resize_actor_runtime_gpu_direct` call the workers, check that exactly `actor_target` ranks report `member` with identical tensor counts, aggregate `resize/gpu_direct_*` metrics |
+| worker | `verl/workers/engine_workers.py` | `TrainingWorker.resize_runtime(old_ranks, new_ranks)` runs on *every* physical rank (`ONE_TO_ALL`): group creation, prepare, verdicts, transfer, commit, teardown; `ActorRolloutRefWorker.resize_actor_runtime` wraps it for actor and co-located ref |
+| engine | `verl/workers/engine/fsdp/transformer_impl.py` | `FSDPEngine.prepare_resize_target` / `transfer_resize_state` / `commit_resize` / `abort_resize`; `check_gpu_direct_resize_supported`; `_build_without_weights` branches of `_build_module` / `_build_fsdp_module` |
+| transfer | `verl/utils/fsdp_resize.py` | `FSDPResizePlanner` (row intervals), `transfer_fsdp2_runtime` / `_Transfer` (manifest, `all_to_all_single`, broadcasts, optimizer/scheduler metadata, checksums), `raise_if_any_failed` |
+
+### What moves
+
+`_build_manifest` on `old_ranks[0]` lists everything; the manifest is broadcast and every rank checks its
+old and new runtime against it (`_check_structure`) before any data moves.
+
+| Item | How | Why it is needed |
+|---|---|---|
+| parameters with `Shard(0)` placement | one `all_to_all_single` per tensor, old local shard as send buffer, new local shard as receive buffer | the weights themselves; tied weights are moved once (`named_parameters()` de-duplicates) |
+| replicated parameters / plain tensors | `broadcast` from `old_ranks[0]` | same |
+| **all** `named_buffers()`, including non-persistent ones such as rotary `inv_freq` | `broadcast` | the new module is built on the meta device and `to_empty`'d, so buffers are uninitialised too; `state_dict()` would miss the non-persistent ones |
+| optimizer state tensors (`exp_avg`, `exp_avg_sq`) | same planner and `all_to_all_single` as the parameter (same shape, same sharding); the new side first allocates `zeros_like(param)` via `_ensure_optimizer_state` | exact training continuation; without them Adam restarts from zero moments |
+| optimizer scalars (`step`), `param_groups` hyper-parameters (minus `params`), `lr_scheduler.state_dict()` | metadata in the manifest (`broadcast_object_list`), applied on the new side | bias correction, current LR / weight decay, warm-up position |
+
+Not moved, and not needed: gradients (the switch happens after `optimizer.step()` and `zero_grad`), FSDP2's
+own bookkeeping (recreated by `fully_shard`), RNG state (training has no dropout; sampling lives in vLLM),
+dataloader position (lives in the trainer process).
+
+### Why one `all_to_all_single` per tensor is enough
+
+FSDP2 shards every parameter along dim 0 with `torch.chunk` semantics (`Shard._local_shard_size_and_offset`),
+so each rank's local shard is a contiguous row interval and the intervals are ordered by mesh rank. With
+`old_ranks` and `new_ranks` both sorted:
+
+* the rows an old rank must send to successive new ranks are consecutive sub-intervals of its own shard, in
+  order -- `FSDPResizePlanner.send_row_splits` partitions the old shard;
+* the rows a new rank receives from successive old ranks are consecutive sub-intervals of its new shard, in
+  order -- `recv_row_splits` partitions the new shard.
+
+`all_to_all_single(recv, send, output_split_sizes, input_split_sizes, group=old ∪ new)` therefore uses
+`old_param.to_local().view(-1)` and `new_param.to_local().view(-1)` directly (`to_local()` returns FSDP2's
+padded sharded storage minus the padding, which is the tensor's permanent home). Send and receive sizes
+differ in general; the only constraints are `send.numel() == sum(input_split_sizes)` and
+`recv.numel() == sum(output_split_sizes)`, both asserted. Ranks on one side only pass a zero-length buffer
+and an all-zero split vector. Rows a rank keeps are NCCL's self chunk, an on-device copy
+(`resize/gpu_direct_self_copy_bytes`); every other row crosses the wire exactly once.
+
+### Worker protocol (`TrainingWorker.resize_runtime`)
+
+Every physical rank executes the same sequence; non-members "accompany" the collectives that need WORLD.
+
+1. `barrier`; `new_group(new_ranks)` and `new_group(old ∪ new)` in the same order on all ranks.
+2. New ranks: `engine.prepare_resize_target(new_pg)` -- save the live runtime attributes, switch
+   `process_group`, set `_build_without_weights=True`, `_init_device_mesh()` (`DeviceMesh.from_group`),
+   `_build_model_optimizer()` (`from_config` on the meta device -> `fully_shard` -> `module.to_empty(device)`,
+   optimizer and scheduler with empty state), park the result in `_resize_target`, restore the live runtime.
+   Old and new runtimes now coexist in the process.
+3. Second verdict exchange: every new rank's target exists, or everyone raises.
+4. `old ∪ new` ranks: `engine.transfer_resize_state(old_ranks, new_ranks, group)` ->
+   `transfer_fsdp2_runtime`: `reshard()` both modules, manifest, structure check, parameters, optimizer
+   state, buffers, optional checksums, `synchronize` + `barrier`. Status per rank: `member` (in the new
+   group), `sender` (old only), `non_member`.
+5. Record `peak_alloc_bytes` (old and new shards coexist), `engine.commit_resize()` (shut the live runtime
+   down, install the target, rebuild `FSDPCheckpointManager`), destroy the old training group and the
+   transfer group, `clear_dtensor_dispatch_caches()` on every rank, refresh dispatch info, `barrier`.
+
+Any exception -> `engine.abort_resize()` drops the half-built target and re-raises. There is no fallback
+path: a failed switch fails the run rather than silently training on wrong state.
+
+### Preconditions (`check_gpu_direct_resize_supported`, checked at startup)
+
+* `actor.strategy=fsdp2` with `fsdp_size=-1` (one-dimensional mesh, `Shard(0)` only);
+* parameters and optimizer state on GPU (no `param_offload` / `optimizer_offload` / FSDP2 `CPUOffloadPolicy`);
+* no LoRA, `ulysses_sequence_parallel_size=1`, CUDA;
+* no critic: `handoff.backend=gpu_direct` together with a critic raises `NotImplementedError` at trainer
+  initialisation (GRPO-style runs only);
+* every actor and rollout size in the schedule is a multiple of the replica size (`_validate_hybrid_split`).
 
 ## Process groups and DTensor caches across resizes
 
@@ -110,10 +194,91 @@ things break on the *second* switch back to a topology that existed before:
   `Could not resolve the process group registered under the name N` at the first DTensor collective
   (gradient clipping is the first). `clear_dtensor_dispatch_caches()` (`verl/utils/distributed.py`) clears
   `propagate_op_sharding` (a `LocalLRUCache` in torch >= 2.9, hence `.cache`), `_propagate_tensor_meta` and
-  `_gen_transform_infos`; `TrainingWorker.destroy_process_group` calls it on **every** rank, members or not.
+  `_gen_transform_infos`; `TrainingWorker.destroy_process_group` and `resize_runtime` call it on **every** rank, members or not.
 * `NCCLCheckpointEngine.finalize()` runs twice with `rebuild_group=True` (after each `update_weights`, and
   again from `reconfigure_checkpoint_engine` when a resize retires the engine) and compared `None >= 0`.
   It now treats `rank is None` as "never joined".
 
 Rules the hybrid runtime imposes: all `new_group` calls happen on every rank in the same order, every
 worker method that touches groups is `ONE_TO_ALL` with barriers, and non-member ranks still make the calls.
+
+## Verification
+
+Always on:
+
+* **structure** -- manifest from `old_ranks[0]`; every rank checks names, shapes, dtypes and placements of its
+  old and new runtime (and optimizer state) against it; verdicts are exchanged so all ranks raise together.
+* **sizes** -- the receive buffer is the real FSDP2 shard, so `numel == sum(splits)` checks that the planner
+  and FSDP2's chunking agree; the trainer checks that every member reports the same tensor counts.
+
+Opt-in, `VERL_RESIZE_VERIFY=1` (metric `resize/gpu_direct_verified`):
+
+* `_shard_digest` computes, per tensor, two int64 sums over the raw 32-bit words of the local shard:
+  `sum(v_i)` and `sum(v_i * ((global_index_i mod 2^20) + 1))`. Because the weight is the *global* flat index,
+  shards of one tensor combine by plain addition however the tensor is cut, so each side reduces its digests
+  inside its own mesh with one `all_reduce` -- no all-gather, no full tensors. The old side computes before
+  the transfer, the new side after; the old digest is broadcast and compared element-wise. The second sum
+  catches rows that landed in the wrong place; integer arithmetic on raw bits makes the comparison exact.
+  Any mismatch names the tensors and raises on every rank. Cost: about 0.3 s for Qwen3-0.6B.
+
+Offline:
+
+* `tests/utils/test_fsdp_resize_on_cpu.py` -- planner against DTensor's own chunking, expand / shrink /
+  non-prefix rank sets, uneven and empty shards, row conservation, invalid input.
+* `tests/special_distributed/run_fsdp2_resize_transfer.py` (`torchrun --nproc-per-node=6`) -- 4 -> 6 -> 2 -> 6
+  with AdamW state: bitwise equality against the old runtime, tied weight and non-persistent buffer
+  restored, and training *continues* on the new mesh against a single-device golden model. The last check
+  matters because `full_tensor()` reads `_local_tensor` through DTensor's own all-gather and would pass even
+  if FSDP2's `_sharded_param_data` had not been written; training exercises FSDP2's all-gather path.
+* `tests/experimental/one_step_off_policy/test_dynamic_resize_control_on_cpu.py` -- trainer-level flow and
+  metrics with mocked worker groups.
+
+Why not just watch the loss: in RL the loss depends on sampled rollouts (which change with replica count,
+batch composition and RNG stream), it is a single scalar, and optimizer state is invisible to it. It
+catches only gross corruption.
+
+## Configuration, environment, metrics
+
+| Setting | Default | Effect |
+|---|---|---|
+| `trainer.dynamic_resize.handoff.backend` | `gpu_direct` (example yaml) | `gpu_direct`: this document; `disk_fallback`: checkpoint round trip (optimizer state not restored across world sizes) |
+| `VERL_RESIZE_VERIFY` | unset | `1`: per-tensor checksum comparison after every transfer |
+| `VERL_LOGGING_LEVEL` | `WARN` | `INFO` shows the `[one-step-off][resize] ...` lines from workers and the server manager |
+
+Metrics reported on a resize step (`step:N - ... - resize/...` line):
+
+| Metric | Meaning |
+|---|---|
+| `resize/gpu_direct_status` | `moved` on success |
+| `resize/gpu_direct_tensor_count`, `resize/gpu_direct_optimizer_tensor_count` | parameters / optimizer tensors moved (Qwen3-0.6B: 310 / 620) |
+| `resize/gpu_direct_net_recv_bytes`, `resize/gpu_direct_self_copy_bytes` | bytes received over NCCL / copied on-device; network bytes equal the lower bound of the shard layout (4 -> 6: 3/4 of the state, 6 -> 2 or 2 -> 6: 5/6) |
+| `resize/gpu_direct_transfer_seconds`, `resize/gpu_direct_peak_alloc_bytes` | transfer wall time; peak device memory while old and new shards coexist |
+| `resize/gpu_direct_verified` | 1.0 when `VERL_RESIZE_VERIFY=1` and all checksums matched |
+| `resize/active_actor_size`, `resize/active_rollout_size` | topology after the switch |
+
+`CKPT_DIR` stays empty with `gpu_direct`; a `global_step_*` directory means the run used `disk_fallback`.
+
+## Measured (8x RTX 5090, PCIe, single node)
+
+* Qwen3-0.6B GRPO, 4 -> 6 -> 2 -> 6 with `VERL_RESIZE_VERIFY=1`: every transfer of the whole fp32 training
+  state (parameters + two Adam moments, ~6 GB) takes 1.0-1.4 s and verifies; network bytes are exactly at
+  the lower bound of the shard layout; training continues normally after each switch.
+* The whole hard switch is about 45 s, of which about 34 s is vLLM engine start-up for the relaunched
+  replicas; the training-state move is no longer on the critical path.
+
+## Limitations and open items
+
+* Validated on one node only. The transfer has no single-node assumption (`old ∪ new` is an arbitrary
+  subgroup of WORLD), but multi-node transport and overlap with compute have not been exercised.
+* `gpu_direct` with a critic is rejected at startup; PPO/GAE runs need `disk_fallback`.
+* Startup builds the actor on the whole pool and moves it to the initial actor ranks with one extra
+  transfer (and one extra full-size model build).
+* Peak device memory during a transfer is old + new shards; a model that fits in training may not fit
+  twice.
+* Every switch kills and relaunches all vLLM server actors (~34 s for Qwen3-0.6B).
+* `prepare_resize_target` relies on FSDP2's `FSDPModule._apply` -> `reset_sharded_param()` making the
+  `to_empty`'d storage the sharded parameter's home (the same mechanism as official meta-device init).
+* `clear_dtensor_dispatch_caches` touches private DTensor caches whose names may change between torch
+  versions (torch 2.9 verified).
+* `disk_fallback` is kept as the alternative backend; it does not restore optimizer state across a world-size
+  change.

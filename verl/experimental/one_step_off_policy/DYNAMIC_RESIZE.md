@@ -8,7 +8,8 @@ the code; the commit messages carry the per-change rationale.
 Related files:
 
 * `README.md` -- the one-step-off recipe itself (pipeline, parameter sync, configuration).
-* `DYNAMIC_RESIZE_DIRECT_RESHARD_PLAN.md` -- the design plan for direct (checkpoint-free) resharding.
+* `DYNAMIC_RESIZE_DIRECT_RESHARD_PLAN.md` -- the original design plan; its section 0 tracks which plan
+  items are implemented on this branch. Sections 1-18 of that file predate the implementation.
 * `config/one_step_off_ppo_trainer_dynamic_resize.yaml` -- the configuration the example uses.
 * `shell/run_dynamic_resize.sh` -- the single-node example launcher.
 
@@ -127,12 +128,14 @@ L=verl/experimental/one_step_off_policy/shell/run_dynamic_resize.sh
 G="algorithm.adv_estimator=grpo actor_rollout_ref.rollout.n=5 actor_rollout_ref.actor.entropy_coeff=0"
 ```
 
-`$G` selects GRPO, which trains no critic; `gpu_direct` rejects a critic at trainer initialisation, so
-its runs need `$G`. The two batch sizes keep a run short. `$RUN` is a new, empty directory for each run.
+`$G` selects GRPO, which trains no critic; without it the launcher runs GAE with the token-classification
+critic. The two batch sizes keep a run short. `$RUN` is a new, empty directory for each run.
 
 ```bash
 # resize: [4,4] (actor, rollout) -> [6,2] at step 2 -> [2,6] at step 4, six steps
 VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L $G
+# the same with GAE and the critic
+VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L
 # back to an earlier topology: [4,4] -> [6,2] -> [4,4]
 VERL_RESIZE_VERIFY=1 SECOND_SPLIT_PLAN="[4,4]" CKPT_DIR=$RUN/ckpt bash $L $G
 # the two default switches through the checkpoint round trip
@@ -145,7 +148,8 @@ A run passes when the launcher exits with code 0 after its last step line (`step
 line (`step:2` and `step:4`) reports `resize/hard_switch_success:1.0`; with resize off every step line
 reports `resize/enabled:0.0` instead. In addition:
 
-* `VERL_RESIZE_VERIFY=1`: every switch line reports `resize/gpu_direct_verified:1.0`.
+* `VERL_RESIZE_VERIFY=1`: every switch line reports `resize/gpu_direct_verified:1.0`, with the critic
+  also `resize/gpu_direct_critic_verified:1.0`.
 * `gpu_direct` leaves no `global_step_*` directory in `CKPT_DIR`; `disk_fallback` leaves one per switch.
 
 ## The hard switch, step by step
@@ -159,8 +163,9 @@ host; the training state moves GPU to GPU.
    workers. The vLLM server actors stay up for now.
 2. **Move the training state** (`_rebuild_hybrid_training_runtime` -> `resize_actor_runtime` on every
    physical rank): build the new FSDP2 runtime on the new ranks next to the live one, fill it shard to
-   shard with one `all_to_all_single` per tensor, swap, destroy the old groups. Details under *Training
-   state: shard-to-shard transfer*.
+   shard with one `all_to_all_single` per tensor, swap, destroy the old groups. The critic goes through the
+   same `resize_runtime` call right after the actor. Details under *Training state: shard-to-shard
+   transfer*.
 3. **Re-point the control plane**: `actor_wg` / `critic_wg` become `RayWorkerGroup.subgroup(new actor ranks)`
    views (no Ray actors are created or destroyed), the rollout view becomes the suffix ranks, and the
    hybrid workers drop their cached server handles (`reset_rollout_server_handle`).
@@ -182,7 +187,7 @@ so a default run shows three transfers: pool -> initial split, then the two sche
 
 | Layer | File | Responsibility |
 |---|---|---|
-| trainer | `one_step_off_policy/ray_trainer.py` | decides the topology; `_resize_actor_runtime_gpu_direct` call the workers, check that exactly `actor_target` ranks report `member` with identical tensor counts, aggregate `resize/gpu_direct_*` metrics |
+| trainer | `one_step_off_policy/ray_trainer.py` | decides the topology; `_resize_actor_runtime_gpu_direct` / `_resize_critic_runtime_gpu_direct` call the workers, check that exactly `actor_target` ranks report `member` with identical tensor counts, aggregate `resize/gpu_direct_*` metrics |
 | worker | `verl/workers/engine_workers.py` | `TrainingWorker.resize_runtime(old_ranks, new_ranks)` runs on *every* physical rank (`ONE_TO_ALL`): group creation, prepare, verdicts, transfer, commit, teardown; `ActorRolloutRefWorker.resize_actor_runtime` wraps it for actor and co-located ref |
 | engine | `verl/workers/engine/fsdp/transformer_impl.py` | `FSDPEngine.prepare_resize_target` / `transfer_resize_state` / `commit_resize` / `abort_resize`; `check_gpu_direct_resize_supported`; `_build_without_weights` branches of `_build_module` / `_build_fsdp_module` |
 | transfer | `verl/utils/fsdp_resize.py` | `FSDPResizePlanner` (row intervals), `transfer_fsdp2_runtime` / `_Transfer` (manifest, `all_to_all_single`, broadcasts, optimizer/scheduler metadata, checksums), `raise_if_any_failed` |
@@ -250,8 +255,10 @@ path: a failed switch fails the run rather than silently training on wrong state
 * `actor.strategy=fsdp2` with `fsdp_size=-1` (one-dimensional mesh, `Shard(0)` only);
 * parameters and optimizer state on GPU (no `param_offload` / `optimizer_offload` / FSDP2 `CPUOffloadPolicy`);
 * no LoRA, `ulysses_sequence_parallel_size=1`, CUDA;
-* no critic: `handoff.backend=gpu_direct` together with a critic raises `NotImplementedError` at trainer
-  initialisation (GRPO-style runs only);
+* the critic, if any, is an `AutoModelForTokenClassification` model (trl value-head critics are rejected);
+  a separate reference worker group is rejected, while a reference model co-located in
+  `ActorRolloutRefWorker` follows the actor through `resize_actor_runtime` as long as it keeps its
+  parameters on GPU;
 * every actor and rollout size in the schedule is a multiple of the replica size (`_validate_hybrid_split`).
 
 ## Process groups and DTensor caches across resizes
@@ -283,7 +290,7 @@ Always on:
 * **sizes** -- the receive buffer is the real FSDP2 shard, so `numel == sum(splits)` checks that the planner
   and FSDP2's chunking agree; the trainer checks that every member reports the same tensor counts.
 
-Opt-in, `VERL_RESIZE_VERIFY=1` (metric `resize/gpu_direct_verified`):
+Opt-in, `VERL_RESIZE_VERIFY=1` (metric `resize/gpu_direct_verified`, `resize/gpu_direct_critic_verified`):
 
 * `_shard_digest` computes, per tensor, two int64 sums over the raw 32-bit words of the local shard:
   `sum(v_i)` and `sum(v_i * ((global_index_i mod 2^20) + 1))`. Because the weight is the *global* flat index,
@@ -326,6 +333,7 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 | `resize/gpu_direct_net_recv_bytes`, `resize/gpu_direct_self_copy_bytes` | bytes received over NCCL / copied on-device; network bytes equal the lower bound of the shard layout (4 -> 6: 3/4 of the state, 6 -> 2 or 2 -> 6: 5/6) |
 | `resize/gpu_direct_transfer_seconds`, `resize/gpu_direct_peak_alloc_bytes` | transfer wall time; peak device memory while old and new shards coexist |
 | `resize/gpu_direct_verified` | 1.0 when `VERL_RESIZE_VERIFY=1` and all checksums matched |
+| `resize/gpu_direct_critic_*` | the same for the critic |
 | `resize/active_actor_size`, `resize/active_rollout_size` | topology after the switch |
 
 `CKPT_DIR` stays empty with `gpu_direct`; a `global_step_*` directory means the run used `disk_fallback`.
@@ -342,7 +350,6 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 
 * Validated on one node only. The transfer has no single-node assumption (`old ∪ new` is an arbitrary
   subgroup of WORLD), but multi-node transport and overlap with compute have not been exercised.
-* `gpu_direct` with a critic is rejected at startup; PPO/GAE runs need `disk_fallback`.
 * Startup builds the actor on the whole pool and moves it to the initial actor ranks with one extra
   transfer (and one extra full-size model build).
 * Peak device memory during a transfer is old + new shards; a model that fits in training may not fit

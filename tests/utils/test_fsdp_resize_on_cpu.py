@@ -14,7 +14,7 @@
 
 import pytest
 
-from verl.utils.fsdp_resize import FSDPResizePlanner, compute_1d_shard_range
+from verl.utils.fsdp_resize import FSDPResizePlanner, ResizeUnit, compute_1d_shard_range, order_units
 
 
 @pytest.mark.parametrize(
@@ -131,3 +131,13 @@ def test_planner_handles_uneven_and_empty_target_shards():
 def test_planner_rejects_empty_or_unsorted_rank_lists(old_ranks, new_ranks):
     with pytest.raises(ValueError):
         FSDPResizePlanner(8, old_ranks, new_ranks)
+
+
+def test_low_memory_pipeline_orders_units_to_minimise_the_peak():
+    units = [ResizeUnit("<root>", ["embed"], []), ResizeUnit("layers.0", ["a"], []), ResizeUnit("layers.1", ["b"], [])]
+    sizes = {"<root>": 100, "layers.0": 10, "layers.1": 20}
+
+    # expanding: memory falls per unit, so the smallest unit goes first (peak = old + smallest new shard)
+    assert [u.name for u in order_units(units, sizes, expanding=True)] == ["layers.0", "layers.1", "<root>"]
+    # shrinking: memory rises per unit, so the largest unit goes first (peak = new + smallest old shard)
+    assert [u.name for u in order_units(units, sizes, expanding=False)] == ["<root>", "layers.1", "layers.0"]

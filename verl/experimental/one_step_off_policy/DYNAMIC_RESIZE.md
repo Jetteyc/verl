@@ -94,3 +94,26 @@ TOTAL_TRAINING_STEPS=8 bash .../run_dynamic_resize.sh \
    agent-loop manager.
 6. `reconfigure_checkpoint_engine` with a fresh group name, then `update_weights` pushes the actor
    weights to the new replicas and resumes generation.
+
+Steps 4 and 6 destroy and recreate process groups on every switch; the caveats this creates are
+described under *Process groups and DTensor caches across resizes* below.
+
+## Process groups and DTensor caches across resizes
+
+Every hard switch destroys the training subgroup and the weight-sync engine and creates new ones. Two
+things break on the *second* switch back to a topology that existed before:
+
+* `DeviceMesh.__eq__` / `__hash__` compare content (rank list, shape, dim names) and ignore the process
+  group, which the mesh references by name. DTensor's sharding propagator and redistribute planner cache
+  results keyed on specs that contain the mesh. After a subgroup is destroyed and a later switch recreates
+  one with identical ranks, the cache hits and returns a spec whose mesh resolves to the dead group:
+  `Could not resolve the process group registered under the name N` at the first DTensor collective
+  (gradient clipping is the first). `clear_dtensor_dispatch_caches()` (`verl/utils/distributed.py`) clears
+  `propagate_op_sharding` (a `LocalLRUCache` in torch >= 2.9, hence `.cache`), `_propagate_tensor_meta` and
+  `_gen_transform_infos`; `TrainingWorker.destroy_process_group` calls it on **every** rank, members or not.
+* `NCCLCheckpointEngine.finalize()` runs twice with `rebuild_group=True` (after each `update_weights`, and
+  again from `reconfigure_checkpoint_engine` when a resize retires the engine) and compared `None >= 0`.
+  It now treats `rank is None` as "never joined".
+
+Rules the hybrid runtime imposes: all `new_group` calls happen on every rank in the same order, every
+worker method that touches groups is `ONE_TO_ALL` with barriers, and non-member ranks still make the calls.

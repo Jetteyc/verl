@@ -136,16 +136,17 @@ def test_gpu_direct_resize_moves_actor_runtime_between_active_and_target_ranks()
         def __init__(self):
             self.calls = []
 
-        def resize_actor_runtime(self, old_ranks, new_ranks):
-            self.calls.append((old_ranks, new_ranks))
+        def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
+            self.calls.append((old_ranks, new_ranks, low_memory))
             return _gpu_direct_worker_results(old_ranks, new_ranks)
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct", "gpu_direct_low_memory": True})
 
     metrics = trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
-    assert trainer._physical_actor_rollout_wg.calls == [([0, 1, 2, 3], [0, 1, 2, 3, 4, 5])]
+    assert trainer._physical_actor_rollout_wg.calls == [([0, 1, 2, 3], [0, 1, 2, 3, 4, 5], True)]
     assert metrics["resize/gpu_direct_status"] == "moved"
     assert metrics["resize/gpu_direct_tensor_count"] == 7.0
     assert metrics["resize/gpu_direct_optimizer_tensor_count"] == 14.0
@@ -156,18 +157,19 @@ def test_gpu_direct_resize_moves_actor_runtime_between_active_and_target_ranks()
     # shrink goes through the same path
     trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
     metrics = trainer._resize_actor_runtime_gpu_direct([0, 1])
-    assert trainer._physical_actor_rollout_wg.calls[-1] == ([0, 1, 2, 3, 4, 5], [0, 1])
+    assert trainer._physical_actor_rollout_wg.calls[-1] == ([0, 1, 2, 3, 4, 5], [0, 1], True)
     assert metrics["resize/gpu_direct_status"] == "moved"
 
 
 def test_gpu_direct_resize_fails_fast_on_incomplete_member_set():
     class _PhysicalWorkerGroup:
-        def resize_actor_runtime(self, old_ranks, new_ranks):
+        def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
             return _gpu_direct_worker_results(old_ranks, new_ranks[:-1])
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct"})
 
     with pytest.raises(RuntimeError, match="expected 6"):
         trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])

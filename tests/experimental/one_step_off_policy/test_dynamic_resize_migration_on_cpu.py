@@ -102,7 +102,12 @@ def test_separate_rollout_manager_receives_no_actor_worker_group():
     assert create.call_args.kwargs["worker_group"] is None
 
 
-def test_direct_restore_still_loads_scheduler_and_rng():
+def test_checkpoint_restore_always_loads_the_full_actor_state():
+    """The checkpoint fallback has no weights-only mode left.
+
+    GPU-direct resize never reaches this helper: optimizer state and the scheduler travel inside the
+    shard-to-shard transfer, and RNG stays with the persistent worker processes.
+    """
     cls = _load_methods(
         TRAINER,
         "OneStepOffRayTrainer",
@@ -114,9 +119,9 @@ def test_direct_restore_still_loads_scheduler_and_rng():
     trainer.actor_rollout_wg = SimpleNamespace(load_checkpoint=Mock(), load_replicated_state_for_resize=Mock())
     trainer.critic_wg = SimpleNamespace(load_checkpoint=Mock())
     trainer.use_critic = True
-    trainer._load_dynamic_resize_checkpoint("checkpoint", load_actor=False)
-    trainer.actor_rollout_wg.load_checkpoint.assert_not_called()
-    trainer.actor_rollout_wg.load_replicated_state_for_resize.assert_called_once_with("checkpoint/actor")
+    trainer._load_dynamic_resize_checkpoint("checkpoint")
+    trainer.actor_rollout_wg.load_checkpoint.assert_called_once_with("checkpoint/actor", del_local_after_load=False)
+    trainer.actor_rollout_wg.load_replicated_state_for_resize.assert_not_called()
     trainer.critic_wg.load_checkpoint.assert_called_once_with("checkpoint/critic", del_local_after_load=False)
 
 

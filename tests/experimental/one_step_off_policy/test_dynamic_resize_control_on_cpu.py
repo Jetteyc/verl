@@ -15,6 +15,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from omegaconf import OmegaConf
 
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
@@ -122,48 +123,86 @@ def test_dynamic_resize_recipe_enables_phase_one_gpu_direct_model_handoff():
     assert cfg.trainer.dynamic_resize.handoff.optimizer_full_state_restore is False
 
 
-def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
+def _gpu_direct_worker_results(old_ranks, new_ranks, world_size=8):
+    results = []
+    for rank in range(world_size):
+        if rank in new_ranks:
+            results.append(
+                {
+                    "rank": rank,
+                    "status": "member",
+                    "tensor_count": 7,
+                    "optimizer_tensor_count": 14,
+                    "net_recv_bytes": 0 if rank in old_ranks else 100,
+                    "self_copy_bytes": 50 if rank in old_ranks else 0,
+                    "transfer_seconds": 0.5 + 0.1 * rank,
+                }
+            )
+        elif rank in old_ranks:
+            results.append({"rank": rank, "status": "sender", "tensor_count": 7, "net_recv_bytes": 0})
+        else:
+            results.append({"rank": rank, "status": "non_member"})
+    return results
+
+
+def test_gpu_direct_resize_moves_actor_runtime_between_active_and_target_ranks():
     class _PhysicalWorkerGroup:
-        def stage_actor_model_for_resize(self, old_ranks, new_ranks):
-            assert old_ranks == [0, 1, 2, 3]
-            assert new_ranks == [0, 1, 2, 3, 4, 5]
-            return [{"status": "staged", "tensor_count": 7, "staged_bytes": 10} for _ in range(6)] + [
-                {"status": "non_member", "tensor_count": 0, "staged_bytes": 0} for _ in range(2)
-            ]
+        def __init__(self):
+            self.calls = []
+
+        def resize_actor_runtime(self, old_ranks, new_ranks):
+            self.calls.append((old_ranks, new_ranks))
+            return _gpu_direct_worker_results(old_ranks, new_ranks)
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
 
-    metrics = trainer._stage_gpu_direct_actor_model(actor_target=6)
+    metrics = trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+    assert trainer._physical_actor_rollout_wg.calls == [([0, 1, 2, 3], [0, 1, 2, 3, 4, 5])]
+    assert metrics["resize/gpu_direct_status"] == "moved"
+    assert metrics["resize/gpu_direct_tensor_count"] == 7.0
+    assert metrics["resize/gpu_direct_optimizer_tensor_count"] == 14.0
+    assert metrics["resize/gpu_direct_net_recv_bytes"] == 200.0  # only the two joining ranks pull data
+    assert metrics["resize/gpu_direct_self_copy_bytes"] == 200.0
+    assert metrics["resize/gpu_direct_transfer_seconds"] == 1.0
 
-    assert metrics["resize/handoff_model_transfer_status"] == "staged"
-    assert metrics["resize/handoff_model_transfer_success"] == 0.0
-    assert metrics["resize/handoff_model_transfer_tensor_count"] == 7.0
-    assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
+    # shrink goes through the same path
+    trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
+    metrics = trainer._resize_actor_runtime_gpu_direct([0, 1])
+    assert trainer._physical_actor_rollout_wg.calls[-1] == ([0, 1, 2, 3, 4, 5], [0, 1])
+    assert metrics["resize/gpu_direct_status"] == "moved"
 
 
-def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():
+def test_gpu_direct_resize_fails_fast_on_incomplete_member_set():
+    class _PhysicalWorkerGroup:
+        def resize_actor_runtime(self, old_ranks, new_ranks):
+            return _gpu_direct_worker_results(old_ranks, new_ranks[:-1])
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+
+    with pytest.raises(RuntimeError, match="expected 6"):
+        trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+
+
+def test_dynamic_resize_checkpoint_load_restores_actor_and_critic():
     class _WorkerGroup:
         def __init__(self):
             self.calls = []
-            self.replicated_calls = []
 
         def load_checkpoint(self, path, del_local_after_load):
             self.calls.append((path, del_local_after_load))
-
-        def load_replicated_state_for_resize(self, path):
-            self.replicated_calls.append(path)
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer.actor_rollout_wg = _WorkerGroup()
     trainer.critic_wg = _WorkerGroup()
     trainer.use_critic = True
 
-    trainer._load_dynamic_resize_checkpoint("/tmp/global_step_1", load_actor=False)
+    trainer._load_dynamic_resize_checkpoint("/tmp/global_step_1")
 
-    assert trainer.actor_rollout_wg.calls == []
-    assert trainer.actor_rollout_wg.replicated_calls == ["/tmp/global_step_1/actor"]
+    assert trainer.actor_rollout_wg.calls == [("/tmp/global_step_1/actor", False)]
     assert trainer.critic_wg.calls == [("/tmp/global_step_1/critic", False)]
 
 

@@ -60,6 +60,9 @@ trainer:
       # no checkpoint is written or read for the switch and a failure aborts the run.
       # VERL_RESIZE_VERIFY=1 additionally checksums every moved tensor against the source.
       backend: gpu_direct
+      # Move one FSDP2 unit (decoder layer) at a time: peak device memory max(old, new) + one unit instead
+      # of old + new shards. Same communication; relies on FSDP2 internals, so off by default.
+      gpu_direct_low_memory: false
       chunk_mb: 256
       stage_optimizer: false
       optimizer_restore_policy: deferred

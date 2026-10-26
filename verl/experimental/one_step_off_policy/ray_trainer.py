@@ -285,6 +285,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/gpu_direct_peak_alloc_bytes": 0.0,
             "resize/rollout_replicas_kept": 0.0,
             "resize/rollout_replicas_retired": 0.0,
+            "resize/rollout_replicas_slept": 0.0,
+            "resize/rollout_replicas_woken": 0.0,
             "resize/rollout_replicas_launched": 0.0,
             "resize/rollout_rebuild_seconds": 0.0,
             "resize/hard_switch_seconds": 0.0,
@@ -979,12 +981,20 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self._latest_rollout_rebuild_metrics = {}
         if llm_server_manager is not None and self.hybrid_engine and actor_target is not None:
             # Hybrid: only the replicas whose GPUs become training ranks go away, and they go away now so
-            # the training side finds the memory free. The remaining replicas keep their engines, weights
-            # and KV cache (they are paused by abort_replicas and resumed by the final update_weights).
-            retired = await llm_server_manager.retire_hybrid_replicas_below(actor_target)
-            if retired:
-                logger.info("[one-step-off][resize] retired rollout replicas %s ahead of the training rebuild", retired)
-            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired))
+            # the training side finds the memory free -- killed, or (dormant_rollout_replicas) put to sleep so
+            # they can be woken instead of relaunched when the GPUs come back. The remaining replicas keep
+            # their engines, weights and KV cache (paused by abort_replicas, resumed by the final update_weights).
+            retired = await llm_server_manager.retire_hybrid_replicas_below(
+                actor_target, dormant=self._host_staging_config.dormant_rollout_replicas
+            )
+            if retired["shutdown"] or retired["slept"]:
+                logger.info(
+                    "[one-step-off][resize] rollout replicas ahead of the training rebuild: shut down %s, parked %s",
+                    retired["shutdown"],
+                    retired["slept"],
+                )
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired["shutdown"]))
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_slept"] = float(len(retired["slept"]))
 
         if llm_server_manager is not None:
             if not self.hybrid_engine:
@@ -1152,6 +1162,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         rollout_metrics.update(
             {
                 "resize/rollout_replicas_kept": float(len(rebuild.get("kept", []))),
+                "resize/rollout_replicas_woken": float(len(rebuild.get("woken", []))),
                 "resize/rollout_replicas_launched": float(len(rebuild.get("launched", []))),
                 "resize/rollout_replicas_retired": float(
                     rollout_metrics.get("resize/rollout_replicas_retired", 0.0) + len(rebuild.get("retired", []))

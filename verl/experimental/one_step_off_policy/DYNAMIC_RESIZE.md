@@ -84,9 +84,11 @@ to `(actor_target, rollout_target)`. Nothing is written to or read from disk, an
 host; the training state moves GPU to GPU.
 
 1. **Rollout makes room** (`_destroy_dynamic_resize_runtime(actor_target)`): abort in-flight requests on
-   every replica, kill the agent-loop workers, then `LLMServerManager.retire_hybrid_replicas_below(actor_target)`
-   shuts down only the replicas whose GPUs become training ranks and removes them from the load balancer.
-   Replicas that stay on rollout GPUs are untouched.
+   every replica, kill the agent-loop workers, then `LLMServerManager.retire_hybrid_replicas_below(actor_target,
+   dormant=handoff.dormant_rollout_replicas)`: the replicas whose GPUs become training ranks are put to
+   sleep (vLLM sleep level 2: weights and KV cache freed, server actor, engine and TP communicators kept)
+   and dropped from the load balancer; with `dormant=false` they are shut down instead. Replicas that stay
+   on rollout GPUs are untouched.
 2. **Move the training state** (`_rebuild_hybrid_training_runtime` -> `resize_actor_runtime` on every
    physical rank): build the new FSDP2 runtime on the new ranks next to the live one, fill it shard to
    shard with one `all_to_all_single` per tensor, swap, destroy the old groups. The critic goes through the
@@ -96,12 +98,14 @@ host; the training state moves GPU to GPU.
    views (no Ray actors are created or destroyed), the rollout view becomes the suffix ranks, and the
    hybrid workers drop their cached server handles (`reset_rollout_server_handle`).
 4. **Re-plan rollout** (`LLMServerManager.rebuild_hybrid_runtime(start_rank=actor_target // TP)`):
-   `plan_hybrid_replica_reuse` diffs the live replicas against the new GPU pairs -- survivors are kept
-   with engine, weights and KV cache intact, pairs new to rollout get a freshly launched replica -- and
-   the load balancer is updated in place (`add_servers` / `remove_servers`). Details under *Rollout side*.
+   `plan_hybrid_replica_reuse` classifies every new GPU pair as *keep* (a live replica already sits
+   there), *wake* (a dormant replica sits there) or *launch* (the pair has never been rollout); the load
+   balancer is updated in place. Details under *Rollout side*.
 5. **Weight sync**: `reconfigure_checkpoint_engine(group_name, rebuild_group=True)` finalizes the old NCCL
    weight-sync engine and creates a new one on every rank; `CheckpointEngineManager.update_weights`
-   pushes the current actor weights to the replicas and resumes generation.
+   pushes the current actor weights to all replicas -- kept, woken and launched alike -- and resumes
+   generation. A woken replica's weights are garbage after a level-2 sleep and are filled here exactly
+   like a fresh replica's, so one-step-off staleness is unchanged.
 6. The trainer records the new topology and launches the next step's generation on the new rollout ranks.
 
 Startup does not transfer anything: `init_model(actor_ranks=initial_actor_ranks)` builds the training
@@ -222,9 +226,18 @@ Its `replica_rank` (hence its server actor name and port) depends only on its ph
 hybrid workers' `ServerAdapter` resolves the server by that name. So a replica that stays needs no rename
 and no reconnect, and `rebuild_hybrid_runtime` is a diff rather than a rebuild:
 
-* `LLMServerManager.retire_hybrid_replicas_below(physical_rank)` -- called before the training side allocates on those GPUs; removes the affected servers from the load balancer and shuts them down (`shutdown_runtime(kill_workers=False)`).
-* `plan_hybrid_replica_reuse(live, new_workers, start_rank, replica_world_size)` (pure, CPU-tested) -- for every new GPU pair: **keep** if a live replica with the same `replica_rank`, the same worker handles and live servers sits there; otherwise **launch**. Live replicas outside the new range are retired (normally already done in step 1).
-* `rebuild_hybrid_runtime` executes the plan: kept replicas only update `worker_group_rank`, launched ones run `init_hybrid`; the load balancer gets `add_servers`; the agent-loop manager is recreated. The old kill-everything path remains as `_rebuild_hybrid_runtime_from_scratch` for trtllm.
+* `LLMServerManager.retire_hybrid_replicas_below(physical_rank, dormant)` -- called before the training side allocates on those GPUs; removes the affected servers from the load balancer and either sleeps them (`_sleep_replicas`: abort -> `replica.sleep(force=True)` -> park in `_dormant_replicas`) or shuts them down (`_shutdown_replicas`).
+* `plan_hybrid_replica_reuse(live, new_workers, start_rank, replica_world_size, dormant)` (pure, CPU-tested) -- for every new GPU pair: **keep** if a live replica with the same `replica_rank`, the same worker handles and live servers sits there; **wake** if a dormant replica with the same `replica_rank` and workers sits there; otherwise **launch**. Live replicas outside the new range are retired (normally already done in step 1); dormant ones outside the range stay asleep.
+* `rebuild_hybrid_runtime` executes the plan: kept replicas only update `worker_group_rank`, woken ones run `wake_up()` (weights + KV cache re-allocated, prefix cache reset) concurrently with the `init_hybrid` of launched ones; the load balancer gets `add_servers`; the agent-loop manager is recreated. The old kill-everything path remains as `_rebuild_hybrid_runtime_from_scratch` for trtllm.
+
+**Dormant replicas.** `handoff.dormant_rollout_replicas` (default `true`) requires vLLM with
+`enable_sleep_mode=true` (`supports_dormant_replicas()`); otherwise the manager logs a warning and shuts
+replicas down instead. The one-step-off recipe runs with `rollout.free_cache_engine=False`, which makes
+`vLLMHttpServer.sleep()` a no-op for the replicas that must stay online; `sleep(force=True)` on
+`vLLMHttpServer`, `vLLMReplica` and the `RolloutReplica` base (which raises for other backends) bypasses
+that only for the replicas that make room. Sleep level 2 keeps the server actor, the engine core, the TP
+worker processes and their NCCL communicators; about 0.86 GB of CUDA context per GPU remains on the
+training GPUs. Pairs that have never been rollout are still launched cold -- there is no pre-launched pool.
 
 What a switch keeps and what it rebuilds:
 
@@ -233,7 +246,8 @@ What a switch keeps and what it rebuilds:
 | hybrid worker processes, CUDA contexts, WORLD process group | kept |
 | training subgroups and their NCCL communicators, DeviceMesh / DTensor caches | destroyed and recreated / cleared |
 | actor / critic parameters, optimizer state, scheduler, buffers | moved shard to shard |
-| vLLM server actors and their engine / TP worker processes | kept if their GPUs stay rollout; shut down if their GPUs become training; launched for GPU pairs that join rollout |
+| vLLM server actors and their engine / TP worker processes | kept if their GPUs stay rollout; slept if their GPUs become training; woken if they return; launched only for GPU pairs that were never rollout |
+| vLLM KV cache | kept on surviving replicas; freed on sleep, re-allocated on wake |
 | load balancer | kept, servers added / removed in place |
 | weight-sync NCCL group (checkpoint engine) | recreated with a fresh group name; `rebuild_group=True` from then on |
 | agent-loop workers | recreated |
@@ -287,7 +301,7 @@ Offline:
   matters because `full_tensor()` reads `_local_tensor` through DTensor's own all-gather and would pass even
   if FSDP2's `_sharded_param_data` had not been written; training exercises FSDP2's all-gather path.
 * `tests/workers/rollout/test_hybrid_replica_reuse_on_cpu.py` -- `plan_hybrid_replica_reuse` and the
-  manager's retire / rebuild flow with fake replicas.
+  manager's retire / rebuild / sleep / wake flow with fake replicas.
 * `tests/experimental/one_step_off_policy/test_dynamic_resize_control_on_cpu.py` -- trainer-level flow and
   metrics with mocked worker groups.
 
@@ -301,6 +315,7 @@ catches only gross corruption.
 |---|---|---|
 | `trainer.dynamic_resize.handoff.backend` | `gpu_direct` (example yaml) | `gpu_direct`: this document; `disk_fallback`: checkpoint round trip (optimizer state not restored across world sizes) |
 | `trainer.dynamic_resize.handoff.gpu_direct_low_memory` | `false` | one FSDP2 unit at a time, peak `max(old, new) + one unit` |
+| `trainer.dynamic_resize.handoff.dormant_rollout_replicas` | `true` | sleep / wake vLLM replicas instead of kill / relaunch; `false` falls back to the kill path |
 | `VERL_RESIZE_VERIFY` | unset | `1`: per-tensor checksum comparison after every transfer |
 | `VERL_LOGGING_LEVEL` | `WARN` | `INFO` shows the `[one-step-off][resize] ...` lines from workers and the server manager |
 
@@ -314,7 +329,7 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 | `resize/gpu_direct_transfer_seconds`, `resize/gpu_direct_peak_alloc_bytes` | transfer wall time; peak device memory while old and new shards coexist |
 | `resize/gpu_direct_verified` | 1.0 when `VERL_RESIZE_VERIFY=1` and all checksums matched |
 | `resize/gpu_direct_critic_*` | the same for the critic |
-| `resize/rollout_replicas_kept`, `_retired`, `_launched` | replica plan of the switch; `kept + launched == rollout_size / TP` |
+| `resize/rollout_replicas_kept`, `_slept`, `_woken`, `_retired`, `_launched` | replica plan of the switch; `kept + woken + launched == rollout_size / TP` |
 | `resize/rollout_rebuild_seconds`, `resize/hard_switch_seconds` | rollout re-plan time (milliseconds without a launch, 35-50 s with one); whole switch wall time |
 | `resize/active_actor_size`, `resize/active_rollout_size` | topology after the switch |
 
@@ -322,19 +337,30 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 
 ## Measured (8x RTX 5090, PCIe, single node)
 
-* Qwen3-0.6B GRPO, [4,4] -> [6,2] -> [2,6] -> [6,2]: the training-state move takes 1.0-1.4 s per switch
-  and verifies. A switch that shrinks rollout (no replica to launch) takes 6.8 s end to end, down from
-  about 45 s; a switch that expands rollout takes 56 s because the new replicas' start-up is on the
-  critical path. The replica on GPUs 6,7 kept the same server process through all three switches.
-* Qwen2.5-3B, 4 -> 6 -> 4: default path 1.70 / 1.53 s, low-memory pipeline 1.70 / 1.77 s; peak device
-  memory for 6 -> 4 drops from 16.6 GB to 10.4 GB with the pipeline.
+Qwen3-0.6B GRPO, `VERL_RESIZE_VERIFY=1`, [4,4] -> [6,2] -> [2,6] -> [6,2] -> [2,6] (replica 1 = GPUs 2,3,
+replica 2 = GPUs 4,5, replica 3 = GPUs 6,7):
+
+| Step | Switch | Training-state move (time, network bytes) | kept / slept / woken / launched | Rollout re-plan | Whole switch |
+|---|---|---|---|---|---|
+| 2 | [4,4] -> [6,2] | 1.22 s, 5.4 GB | 1 / 1 / 0 / 0 | 0.4 ms | 6.6 s |
+| 4 | [6,2] -> [2,6] | 1.05 s, 6.0 GB | 1 / 0 / 1 / 1 (GPUs 2,3 first time) | 37.2 s | 43.4 s |
+| 6 | [2,6] -> [6,2] | 1.15 s, 6.0 GB | 1 / 2 / 0 / 0 | 0.2 ms | 5.8 s |
+| 8 | [6,2] -> [2,6] | 1.03 s, 6.0 GB | 1 / 0 / 2 / 0 | 35 ms | 6.1 s |
+
+Before replica reuse every switch was about 45 s (34 s of vLLM start-up). A sleeping replica leaves about
+0.86 GB per GPU (TP worker CUDA context) versus about 10 GB for an active one; generation speed after a
+wake matches a fresh replica in the same topology. Qwen2.5-3B, 4 -> 6 -> 4: default path 1.70 / 1.53 s,
+low-memory pipeline 1.70 / 1.77 s, peak device memory for 6 -> 4 16.6 GB -> 10.4 GB with the pipeline.
 
 ## Limitations and open items
 
 * Validated on one node only. The transfer has no single-node assumption (`old ∪ new` is an arbitrary
   subgroup of WORLD), but multi-node transport and overlap with compute have not been exercised.
-* Switches that give GPUs back to rollout pay a cold vLLM launch for the new replicas (~35-50 s). Hiding
-  it needs either dormant replicas or an asynchronous join of new replicas after generation resumes.
+* A GPU pair that has never been rollout still pays a cold vLLM launch the first time (~35-50 s). An
+  asynchronous join (generate on survivors while new replicas start) and a pre-launched replica pool are
+  not implemented.
+* Sleeping replicas leave about 0.86 GB per training GPU; use `dormant_rollout_replicas=false` when a
+  large model is at the memory edge.
 * `prepare_resize_target` relies on FSDP2's `FSDPModule._apply` -> `reset_sharded_param()` making the
   `to_empty`'d storage the sharded parameter's home (the same mechanism as official meta-device init); the low-memory pipeline additionally uses `FSDPParam._sharded_param_data`, `reset_sharded_param` and `swap_tensors` directly.
 * `clear_dtensor_dispatch_caches` touches private DTensor caches whose names may change between torch
